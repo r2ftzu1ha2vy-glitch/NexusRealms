@@ -263,6 +263,21 @@ function rebuildChunk(cx, cz) {
   if (mesh) { scene.add(mesh); chunkMeshes[k] = mesh; }
 }
 
+   // Reusable frustum for culling
+const _frustum = new THREE.Frustum();
+const _projScreenMatrix = new THREE.Matrix4();
+
+function isChunkVisible(cx, cz) {
+  camera.updateMatrixWorld();
+  _projScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  _frustum.setFromProjectionMatrix(_projScreenMatrix);
+  // Build a bounding box for this chunk
+  const box = new THREE.Box3(
+    new THREE.Vector3(cx * CHUNK_W, 0, cz * CHUNK_D),
+    new THREE.Vector3(cx * CHUNK_W + CHUNK_W, CHUNK_H, cz * CHUNK_D + CHUNK_D)
+  );
+  return _frustum.intersectsBox(box);
+}
 // ── CHUNK MANAGEMENT ──────────────────────────────────────
 let lastPlayerChunk = { cx: null, cz: null };
 
@@ -275,7 +290,7 @@ function updateChunks() {
   // Load needed chunks
   for (let dx = -RENDER_DIST; dx <= RENDER_DIST; dx++) {
     for (let dz = -RENDER_DIST; dz <= RENDER_DIST; dz++) {
-      const cx = pcx+dx, cz = pcz+dz;
+      const cx = pcx + dx, cz = pcz + dz;
       const k = chunkKey(cx, cz);
       if (!world[k]) {
         world[k] = generateChunk(cx, cz);
@@ -284,13 +299,16 @@ function updateChunks() {
     }
   }
 
-  // Unload far chunks
+  // Unload far chunks, hide out-of-frustum ones
   Object.keys(chunkMeshes).forEach(k => {
     const [cx, cz] = k.split(',').map(Number);
-    if (Math.abs(cx-pcx) > RENDER_DIST+1 || Math.abs(cz-pcz) > RENDER_DIST+1) {
+    if (Math.abs(cx - pcx) > RENDER_DIST + 1 || Math.abs(cz - pcz) > RENDER_DIST + 1) {
       scene.remove(chunkMeshes[k]);
       chunkMeshes[k].geometry.dispose();
       delete chunkMeshes[k];
+    } else {
+      // Hide/show based on frustum — free GPU draw calls
+      chunkMeshes[k].visible = isChunkVisible(cx, cz);
     }
   });
 }
@@ -683,6 +701,7 @@ function updateMobs(dt) {
     mob.pos.y = Math.max(mob.pos.y, 0);
 
     mob.mesh.position.set(mob.pos.x, mob.pos.y+0.8, mob.pos.z);
+    mob.mesh.visible = mob.mesh.position.distanceTo(camera.position) < 60;
     mob.mesh.rotation.y = Math.atan2(dx, dz);
 
     // Attack player
@@ -852,7 +871,6 @@ function gameLoop() {
   renderer.render(scene, camera);
 }
 
-// ── INPUT ─────────────────────────────────────────────────
 function initInput() {
   document.addEventListener('keydown', e => {
     keys[e.code] = true;
@@ -865,16 +883,14 @@ function initInput() {
       onGround = false;
     }
     if (e.code === 'KeyF') {
-      // Eat (if has food-like block in hand)
       if (hunger < maxHunger) {
-        hunger = Math.min(maxHunger, hunger+3);
+        hunger = Math.min(maxHunger, hunger + 3);
         updateHUD();
         showGameToast('🍖 Munched something. Hunger restored!');
       }
     }
-    // Hotbar keys 1-9
     if (e.code.startsWith('Digit')) {
-      const n = parseInt(e.code.replace('Digit','')) - 1;
+      const n = parseInt(e.code.replace('Digit', '')) - 1;
       if (n >= 0 && n < 9) { hotbarSel = n; renderHotbar(); }
     }
   });
@@ -882,13 +898,22 @@ function initInput() {
   document.addEventListener('keyup', e => { keys[e.code] = false; });
 
   canvas.addEventListener('mousedown', e => {
-    if (!mouse.locked) { canvas.requestPointerLock(); return; }
+    // Always hide the hint on any click
+    const hint = document.getElementById('click-hint');
+    if (hint) hint.style.display = 'none';
+
+    if (!mouse.locked) {
+      canvas.requestPointerLock();
+      return;
+    }
     if (e.button === 0) { mouse.breaking = true; hitMob(); }
     if (e.button === 2) placeBlock();
   });
+
   canvas.addEventListener('mouseup', e => {
     if (e.button === 0) mouse.breaking = false;
   });
+
   canvas.addEventListener('contextmenu', e => e.preventDefault());
 
   canvas.addEventListener('mousemove', e => {
@@ -896,7 +921,7 @@ function initInput() {
     const sens = 0.002;
     yaw -= e.movementX * sens;
     pitch -= e.movementY * sens;
-    pitch = Math.max(-Math.PI/2+0.01, Math.min(Math.PI/2-0.01, pitch));
+    pitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, pitch));
   });
 
   canvas.addEventListener('wheel', e => {
@@ -907,9 +932,23 @@ function initInput() {
   document.addEventListener('pointerlockchange', () => {
     mouse.locked = !!document.pointerLockElement;
     const hint = document.getElementById('click-hint');
-    if (hint) hint.style.display = mouse.locked ? 'none' : 'flex';
+    if (!hint) return;
+    // Only show the hint again if we lost lock without pausing/dying
+    if (!mouse.locked && !paused &&
+        document.getElementById('death-screen')?.style.display !== 'flex' &&
+        document.getElementById('inventory-panel')?.style.display !== 'flex') {
+      hint.style.display = 'flex';
+    }
   });
 }
+// Also hide immediately on canvas click (before lock is granted):
+canvas.addEventListener('mousedown', e => {
+  const hint = document.getElementById('click-hint');
+  if (hint) hint.style.display = 'none'; // hide instantly on click
+  if (!mouse.locked) { canvas.requestPointerLock(); return; }
+  if (e.button === 0) { mouse.breaking = true; hitMob(); }
+  if (e.button === 2) placeBlock();
+}, { capture: true }); // use capture so this fires before other listeners   
 
 function togglePause() {
   if (document.getElementById('death-screen')?.style.display === 'flex') return;
